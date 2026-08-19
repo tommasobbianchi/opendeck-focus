@@ -17,12 +17,16 @@ OpenDeck must not be running: it holds these files in memory and rewrites them o
 """
 
 import argparse
+import base64
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from PIL import Image
 
 CONFIG = Path.home() / ".config" / "opendeck"
 LAUNCHER_PROFILE = "Launcher"
@@ -32,6 +36,12 @@ LAUNCHER_APPLICATION = "OpenDeckLauncher"  # must match LAUNCHER_CLASS in src/ma
 # two with buttons behind them take slots 0 and 1, and the knob's screen takes slot 2.
 MODE_KEYS = {0: ("launcher", "Launcher"), 1: ("contextual", "Auto")}
 FIRST_MAIN_KEY = 3
+
+# The mode keys have no application behind them to borrow an icon from, so they ship with
+# their own. Both leave their centre dark, because OpenDeck draws the key's text over the
+# image and the label needs somewhere to sit.
+HERE = Path(__file__).resolve().parent
+MODE_ICONS = {"launcher": HERE / "assets/mode-launcher.png", "contextual": HERE / "assets/mode-contextual.png"}
 
 STARTERPACK = "com.amansprojects.starterpack.sdPlugin"
 LAUNCHAPP = "me.amankhanna.oadesktopentry.sdPlugin"
@@ -88,6 +98,18 @@ def key(position, plugin, uuid, name, tooltip, icon, inspector, settings, text="
     }
 
 
+def mode_icon(mode):
+    """The key's own icon as a data URI, or the plugin's default if the file is missing."""
+    path = MODE_ICONS.get(mode)
+    if not (path and path.is_file()):
+        return str(CONFIG / "plugins" / STARTERPACK / "icons/runCommand.png")
+
+    image = Image.open(path).convert("RGB").resize((96, 96), Image.LANCZOS)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
 def mode_key(position, mode, label, binary):
     return key(
         position,
@@ -95,7 +117,7 @@ def mode_key(position, mode, label, binary):
         "com.amansprojects.starterpack.runcommand",
         "Run Command",
         "Run a command",
-        str(CONFIG / "plugins" / STARTERPACK / "icons/runCommand.png"),
+        mode_icon(mode),
         f"plugins/{STARTERPACK}/propertyInspector/runCommand.html",
         {"down": f"{binary} mode {mode}", "up": "", "rotate": "", "file": "", "show": False},
         label,

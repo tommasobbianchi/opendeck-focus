@@ -109,6 +109,7 @@ pkill -x opendeck && ./set-key-image.py --auto && systemd-run --user --collect /
 | Open URL | the site's own icon — the page is read for its `<link rel=icon>` tags, its apple-touch-icon and its **web app manifest**, largest first, because that is where the sharp 180px and 512px versions live. `/favicon.ico` and Google's favicon cache are only fallbacks, for sites that declare nothing or block the request |
 | Launch App | the application's icon: `Icon=` from its `.desktop` file, resolved through the icon themes on this system (SVGs rasterised via `rsvg-convert`/ImageMagick) or taken as an absolute path, which is how snap and flatpak entries give it. Failing that, the app's **own install tree** is searched — wrapper-launched and AppImage builds keep their icon there and register nothing with any theme |
 | Run Command | the icon of the application the command runs, if some `.desktop` file launches the same executable |
+| the two mode keys | icons of their own, in `assets/` — they have no application behind them to borrow from. Both leave their centre dark, because OpenDeck draws the key's text over the image and the label needs somewhere to sit |
 | anything else | a tile carrying the key's own words, on a clean background. This is a proposal, not an answer: it is offered because a page of identical plugin logos tells you nothing about what the keys do. `--no-labels` declines it |
 
 Where OpenDeck already has text for a key it draws that itself, so the tile stays empty rather
