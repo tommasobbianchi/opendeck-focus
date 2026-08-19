@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Wires an OpenDeck device up for contextual switching plus a launcher page.
 
+Image paths here are absolute on purpose: OpenDeck's webserver serves files by absolute path
+(refusing anything outside the config directory), so a relative "plugins/..." path renders as a
+blank key.
+
 Everything here is ordinary OpenDeck configuration -- profiles, and the application-to-profile
 map its own watcher consults. Nothing is patched; the script exists because clicking it
 together in the UI is tedious, not because the UI cannot do it.
@@ -24,8 +28,10 @@ CONFIG = Path.home() / ".config" / "opendeck"
 LAUNCHER_PROFILE = "Launcher"
 LAUNCHER_APPLICATION = "OpenDeckLauncher"  # must match LAUNCHER_CLASS in src/main.rs
 
-# The two screenless buttons sit in the row below the 15 LCD keys.
-MODE_KEYS = {15: ("launcher", "Launcher"), 16: ("contextual", "Auto")}
+# The strip of small screens sits physically above the 15 main keys, so it is grid row 0: the
+# two with buttons behind them take slots 0 and 1, and the knob's screen takes slot 2.
+MODE_KEYS = {0: ("launcher", "Launcher"), 1: ("contextual", "Auto")}
+FIRST_MAIN_KEY = 3
 
 STARTERPACK = "com.amansprojects.starterpack.sdPlugin"
 LAUNCHAPP = "me.amankhanna.oadesktopentry.sdPlugin"
@@ -89,7 +95,7 @@ def mode_key(position, mode, label, binary):
         "com.amansprojects.starterpack.runcommand",
         "Run Command",
         "Run a command",
-        f"plugins/{STARTERPACK}/icons/runCommand.png",
+        str(CONFIG / "plugins" / STARTERPACK / "icons/runCommand.png"),
         f"plugins/{STARTERPACK}/propertyInspector/runCommand.html",
         {"down": f"{binary} mode {mode}", "up": "", "rotate": "", "file": "", "show": False},
         label,
@@ -103,7 +109,7 @@ def launch_key(position, desktop_file):
         "me.amankhanna.oadesktopentry.launchapp",
         "Launch App",
         "Launch an application",
-        f"plugins/{LAUNCHAPP}/icon.png",
+        str(CONFIG / "plugins" / LAUNCHAPP / "icon.png"),
         f"plugins/{LAUNCHAPP}/pi/launchapp.html",
         {"app": str(desktop_file)},
     )
@@ -166,9 +172,9 @@ def main():
 
     # --- the launcher page ---------------------------------------------------------------
     launcher_keys = [None] * 18
-    position = 0
+    position = FIRST_MAIN_KEY
     for entry in gnome_favourites():
-        if position >= 15:  # only the LCD keys can show what they launch
+        if position >= 18:  # the main block ends here
             break
         desktop_file = find_desktop_file(entry)
         if desktop_file is None:
@@ -181,7 +187,7 @@ def main():
     launcher = load(launcher_path, {"infobars": [], "keys": launcher_keys, "sliders": [None]})
     launcher["keys"] = launcher_keys
     save(launcher_path, launcher)
-    print(f"Launcher profile: {position} app(s) -> {launcher_path}")
+    print(f"Launcher profile: {position - FIRST_MAIN_KEY} app(s) -> {launcher_path}")
 
     # --- mode keys in every profile ------------------------------------------------------
     for profile_path in sorted(device_dir.glob("*.json")):
