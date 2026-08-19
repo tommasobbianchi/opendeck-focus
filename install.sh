@@ -7,6 +7,7 @@ cd "$(dirname "$0")"
 cargo build --release
 install -Dm755 target/release/opendeck-focus ~/.local/bin/opendeck-focus
 install -Dm644 opendeck-focus.service ~/.config/systemd/user/opendeck-focus.service
+install -Dm644 opendeck-icons.service ~/.config/systemd/user/opendeck-icons.service
 
 EXTENSIONS=~/.local/share/gnome-shell/extensions
 mkdir -p "$EXTENSIONS"
@@ -22,8 +23,8 @@ if [[ "$CURRENT" != *"opendeck-focus@nativedev"* ]]; then
 fi
 
 systemctl --user daemon-reload
-systemctl --user enable --now opendeck-focus.service
-systemctl --user --no-pager status opendeck-focus.service | head -5
+systemctl --user enable --now opendeck-focus.service opendeck-icons.service
+systemctl --user --no-pager status opendeck-focus.service opendeck-icons.service | head -12
 
 echo
 echo "Next: stop OpenDeck, run ./setup-n1.py, start OpenDeck."

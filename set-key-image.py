@@ -31,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -566,6 +567,103 @@ def run_auto(profiles_root, device, arguments):
     print(f"{applied} icon(s) applied, {proposed} label(s) proposed.")
 
 
+# --- live mode ----------------------------------------------------------------------------
+#
+# OpenDeck holds profiles in memory, so editing the files under a running instance achieves
+# nothing. It does however accept a whole inbound event on the command line:
+#
+#     opendeck --process-message '{"event":"setImage", ...}'
+#
+# which the running instance handles through its single-instance IPC. That path is explicitly
+# unauthenticated (`process_incoming_message(..., "", true)` in main.rs), so unlike a plugin
+# WebSocket connection -- where setImage is refused for keys the plugin does not own -- it can
+# set the image of any key at all. Nothing here is patched or private to this fork.
+
+
+def opendeck_binary():
+    """The binary of the running instance, so a locally built OpenDeck is not bypassed in
+    favour of a packaged one that is not the instance holding the profiles."""
+    result = subprocess.run(["pgrep", "-x", "opendeck"], capture_output=True, text=True)
+    for pid in result.stdout.split():
+        try:
+            return str(Path(f"/proc/{pid}/exe").resolve())
+        except OSError:
+            continue
+    return None
+
+
+def push_image(device, profile, position, controller, data_uri):
+    binary = opendeck_binary()
+    if binary is None:
+        return False
+    message = json.dumps({
+        "event": "setImage",
+        "context": {"device": device, "profile": profile, "controller": controller, "position": position},
+        "payload": {"image": data_uri},
+    })
+    result = subprocess.run([binary, "--process-message", message], capture_output=True, timeout=30)
+    return result.returncode == 0
+
+
+def signature(slot):
+    """What a key *is*, ignoring how it looks. A key keeps its image while this is unchanged,
+    so an icon set by hand survives, and re-pushing our own image does not loop."""
+    action = (slot.get("action") or {}).get("uuid", "")
+    return json.dumps([action, slot.get("settings") or {}], sort_keys=True)
+
+
+def scan(profiles_root, device):
+    """Yields (profile, controller, position, slot) for every occupied slot of a device."""
+    for path in sorted((profiles_root / device).glob("*.json")):
+        try:
+            profile = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for controller, field in (("Keypad", "keys"), ("Encoder", "sliders")):
+            for position, slot in enumerate(profile.get(field) or []):
+                if slot and slot.get("states"):
+                    yield path.stem, controller, position, slot
+
+
+def run_watch(profiles_root, device, arguments):
+    """Gives a key its icon as soon as it gets a purpose, without stopping OpenDeck.
+
+    The first pass only remembers what is already there: at startup every key looks new, and
+    claiming them all would wipe images set by hand. Run --auto once for the initial fill."""
+    known = {}
+    first_pass = True
+    print(f"Watching {profiles_root / device} for new keys. Ctrl-C to stop.")
+
+    while True:
+        for profile, controller, position, slot in scan(profiles_root, device):
+            key = (profile, controller, position)
+            current = signature(slot)
+            if known.get(key) == current:
+                continue
+            known[key] = current
+
+            if first_pass:
+                continue
+
+            name = (slot.get("action") or {}).get("name", "?")
+            print(f"{profile} {controller.lower()} {position}: {name}")
+            image, description, is_proposal = resolve_icon(slot, arguments.background)
+            if is_proposal and arguments.no_labels:
+                print("    no icon found, leaving it alone")
+                continue
+
+            data_uri = to_data_uri(image, KEY_SIZE, arguments.background)
+            verb = "proposed" if is_proposal else "applied"
+            if push_image(device, profile, position, controller, data_uri):
+                print(f"    {verb}: {description}")
+            else:
+                print(f"    could not reach OpenDeck to apply {description}")
+                del known[key]  # try again next time round
+
+        first_pass = False
+        time.sleep(arguments.interval)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", help="device id (default: the only one)")
@@ -573,17 +671,20 @@ def main():
     parser.add_argument("--key", type=int, help="grid position of a single key to set")
     parser.add_argument("--state", type=int, default=None, help="state to set (default: all)")
     parser.add_argument("--auto", action="store_true", help="give every key the image that belongs on it")
-    parser.add_argument("--no-labels", action="store_true", help="with --auto, leave a key alone rather than proposing a text tile")
+    parser.add_argument("--no-labels", action="store_true", help="leave a key alone rather than proposing a text tile")
+    parser.add_argument("--watch", action="store_true", help="run in the background, giving each new key its image as it is created")
+    parser.add_argument("--interval", type=float, default=2.0, help="seconds between checks in --watch")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--image", help="path to an image file")
     source.add_argument("--favicon", help="URL or domain whose icon to use")
     parser.add_argument("--background", default="#000000", help="fill behind a transparent icon")
     arguments = parser.parse_args()
 
-    if not arguments.auto and (arguments.key is None or not (arguments.image or arguments.favicon)):
-        parser.error("give --auto, or --key with one of --image / --favicon")
+    if not (arguments.auto or arguments.watch) and (arguments.key is None or not (arguments.image or arguments.favicon)):
+        parser.error("give --watch, --auto, or --key with one of --image / --favicon")
 
-    if subprocess.run(["pgrep", "-x", "opendeck"], capture_output=True).returncode == 0:
+    # --watch talks to the running instance instead of its files, so it wants the opposite.
+    if not arguments.watch and subprocess.run(["pgrep", "-x", "opendeck"], capture_output=True).returncode == 0:
         sys.exit("OpenDeck is running; stop it first or it will overwrite this on exit.")
 
     profiles_root = CONFIG / "profiles"
@@ -591,6 +692,9 @@ def main():
     device = arguments.device or (devices[0] if len(devices) == 1 else None)
     if device is None:
         sys.exit(f"Pick one with --device: {', '.join(devices) or 'no devices found'}")
+
+    if arguments.watch:
+        return run_watch(profiles_root, device, arguments)
 
     if arguments.auto:
         return run_auto(profiles_root, device, arguments)
