@@ -98,37 +98,37 @@ creating profiles in the UI.
 
 ## Key images
 
-OpenDeck sets these from its editor: select a key, then **click the large image preview** on
-the left of the editor panel to pick a file (dragging an image onto it works too, and
-right-click resets it to the plugin's default). The control is an unlabelled canvas, which is
-easy to walk past.
-
-To give every **Open URL** key the icon of the site it opens, without naming any of them:
+Every key can be given the image that belongs on it, worked out from what the key does:
 
 ```bash
-./set-key-image.py --auto
+pkill -x opendeck && ./set-key-image.py --auto && systemd-run --user --collect /usr/bin/opendeck
 ```
 
-It reads the URL off each key and asks that page for its icon: the `<link rel=icon>` tags, the
-apple-touch-icon and the web app manifest are all consulted, largest first, because that is
-where the sharp 180px and 512px versions live -- `/favicon.ico` and Google's favicon cache are
-only the fallbacks, for sites that declare nothing or block the request. Onshape, for instance,
-serves a 144px PNG that `/favicon.ico` alone would have missed.
+| Action | Where the image comes from |
+|---|---|
+| Open URL | the site's own icon — the page is read for its `<link rel=icon>` tags, its apple-touch-icon and its **web app manifest**, largest first, because that is where the sharp 180px and 512px versions live. `/favicon.ico` and Google's favicon cache are only fallbacks, for sites that declare nothing or block the request |
+| Launch App | the application's icon: `Icon=` from its `.desktop` file, resolved through the icon themes on this system (SVGs rasterised via `rsvg-convert`/ImageMagick) or taken as an absolute path, which is how snap and flatpak entries give it. Failing that, the app's **own install tree** is searched — wrapper-launched and AppImage builds keep their icon there and register nothing with any theme |
+| Run Command | the icon of the application the command runs, if some `.desktop` file launches the same executable |
+| anything else | a tile carrying the key's own words, on a clean background. This is a proposal, not an answer: it is offered because a page of identical plugin logos tells you nothing about what the keys do. `--no-labels` declines it |
 
-`--auto` replaces the image on every Open URL key, including one you picked by hand: OpenDeck
-rasterises every key to `0.png` on restart, so by then a hand-picked icon and the plugin's
-default globe are indistinguishable. The profile is backed up first.
+Where OpenDeck already has text for a key it draws that itself, so the tile stays empty rather
+than printing the same words twice — which also makes a second `--auto` run a no-op instead of a
+game of telephone with its own output.
+
+`--auto` replaces the image on every key it can resolve, including one you picked by hand:
+OpenDeck rasterises every key to `0.png` on restart, so by then a hand-picked icon and a
+plugin's default are indistinguishable. Profiles are backed up next to themselves first.
 
 Single keys, by URL or from a file:
 
 ```bash
-./set-key-image.py --profile Default --key 6 --favicon https://cad.onshape.com
-./set-key-image.py --profile Launcher --key 4 --image ~/Pictures/icon.png
+./set-key-image.py --key 6 --favicon https://cad.onshape.com
+./set-key-image.py --key 4 --profile Launcher --image ~/Pictures/icon.png
 ```
 
-It writes a data URI into the profile; OpenDeck rasterises it into its own image cache on the
-next start, so the result is identical to having picked the file in the editor. Same rule as
-`setup-n1.py`: OpenDeck must be stopped, and the profile is backed up next to itself.
+OpenDeck can of course do this from its editor too — select a key, then **click the large image
+preview** on the left of the editor panel (drag an image onto it, or right-click to reset). The
+control is an unlabelled canvas, which is easy to walk past.
 
 ## Checking it
 

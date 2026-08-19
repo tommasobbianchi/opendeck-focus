@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Sets the image on a deck key, from a file or from a site's favicon.
+"""Gives deck keys the image that belongs on them.
 
-OpenDeck can do this from its editor -- click a key, then click the image preview -- and that
-is the right way to set one or two. This exists for the cases the editor is tedious for:
-setting a whole page of Open URL keys at once, or scripting a profile from a list of sites.
+    --auto  works out every key's image from what the key does, and applies it.
 
-    --auto  reads the URL off every Open URL key and gives it that site's own icon.
+Where the image comes from depends on the action:
 
-Finding "the right icon" means asking the page rather than guessing at /favicon.ico: the
-<link rel=icon> tags, the apple-touch-icon, and the web app manifest are all consulted, largest
-first, because that is where the sharp 180px and 512px versions live. /favicon.ico and Google's
-favicon cache are the fallbacks, for sites that declare nothing or block us.
+  Open URL     the site's own icon -- the page is read for its <link rel=icon> tags, its
+               apple-touch-icon and its web app manifest, largest first, because that is where
+               the sharp 180px and 512px versions live. /favicon.ico and Google's favicon cache
+               are only the fallbacks, for sites that declare nothing or block the request.
+  Launch App   the application's icon, from `Icon=` in its .desktop file, resolved through the
+               icon themes on this system (SVGs are rasterised) or taken as an absolute path,
+               which is how snap and flatpak entries usually give it.
+  Run Command  the icon of the application the command runs, if a .desktop file launches the
+               same executable.
+  anything     a tile carrying the key's own words. This is a proposal rather than an answer:
+  else         it is offered because a page of identical plugin logos tells you nothing about
+               what the keys do. `--no-labels` declines it.
 
-Images are written into the profile as data URIs, which is one of the forms OpenDeck's renderer
-accepts natively, so nothing has to resolve a path later.
+Single keys can also be set by hand, with --key and --image or --favicon.
 
 OpenDeck must not be running: it holds profiles in memory and rewrites them on exit.
 """
@@ -22,6 +27,7 @@ import argparse
 import base64
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -30,10 +36,18 @@ import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 CONFIG = Path.home() / ".config" / "opendeck"
 KEY_SIZE = (96, 96)
+
+APPLICATION_DIRS = [
+    Path.home() / ".local/share/applications",
+    Path("/usr/share/applications"),
+    Path("/var/lib/snapd/desktop/applications"),
+    Path("/var/lib/flatpak/exports/share/applications"),
+    Path.home() / ".local/share/flatpak/exports/share/applications",
+]
 
 
 # Sites refuse the default urllib agent often enough that it is not worth finding out which.
@@ -176,18 +190,317 @@ def to_data_uri(image, size, background):
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 
+# --- where an icon comes from, per action -------------------------------------------------
+
 OPEN_URL_ACTION = "com.amansprojects.starterpack.openurl"
+LAUNCH_APP_ACTION = "me.amankhanna.oadesktopentry.launchapp"
+RUN_COMMAND_ACTION = "com.amansprojects.starterpack.runcommand"
+SWITCH_PROFILE_ACTION = "com.amansprojects.starterpack.switchprofile"
+
+ICON_ROOTS = [
+    Path.home() / ".local/share/icons",
+    Path.home() / ".icons",
+    Path("/usr/local/share/icons"),
+    Path("/usr/share/icons"),
+    Path("/usr/share/pixmaps"),
+    Path("/var/lib/flatpak/exports/share/icons"),
+]
+
+_icon_index = None
 
 
-def key_url(key):
-    """The URL an Open URL key opens. Key down is what the user actually presses; a key that
-    only acts on release or on a dial turn still has one, so fall back through them."""
-    settings = key.get("settings") or {}
-    for field in ("down", "up", "clockwise", "anticlockwise"):
-        url = (settings.get(field) or "").strip()
-        if url:
-            return url
+def icon_index():
+    """Maps icon name -> files, from every theme directory on the system.
+
+    Built by walking once rather than globbing per name: a dozen keys against a full icon theme
+    is thousands of stat calls otherwise. Not a full freedesktop theme lookup -- it ignores
+    theme inheritance and picks by resolution instead, which is what actually matters here,
+    since a key wants the sharpest version of the icon and not the themed one."""
+    global _icon_index
+    if _icon_index is not None:
+        return _icon_index
+
+    _icon_index = {}
+    for root in ICON_ROOTS:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if path.suffix.lower() in (".png", ".svg", ".xpm") and path.is_file():
+                _icon_index.setdefault(path.stem, []).append(path)
+    return _icon_index
+
+
+def icon_file_size(path):
+    """Best guess at an icon file's resolution, from the theme directory it sits in."""
+    if path.suffix.lower() == ".svg":
+        return 10_000  # scalable: better than any raster, if we can rasterise it
+    for part in path.parts:
+        head = part.split("x")[0]
+        if head.isdigit():
+            return int(head)
+    return 0
+
+
+def rasterise_svg(path, size):
+    """SVGs need an external renderer; ImageMagick is the one most likely to be present."""
+    for command in (
+        ["rsvg-convert", "-w", str(size), "-h", str(size), str(path)],
+        ["magick", "-background", "none", "-density", "384", str(path), "-resize", f"{size}x{size}", "png:-"],
+        ["convert", "-background", "none", "-density", "384", str(path), "-resize", f"{size}x{size}", "png:-"],
+    ):
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=30)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and result.stdout:
+            return decode(result.stdout)
     return None
+
+
+def icon_by_name(name, size=256):
+    """Resolves a .desktop `Icon=` value: an absolute path, or a name in an icon theme."""
+    if not name:
+        return None
+
+    path = Path(name)
+    if path.is_absolute():
+        candidates = [path] if path.is_file() else []
+    else:
+        candidates = icon_index().get(name, [])
+        if not candidates:
+            # Some entries name the file rather than the icon, e.g. Icon=foo.png
+            candidates = icon_index().get(path.stem, [])
+
+    best = None
+    for candidate in sorted(candidates, key=icon_file_size, reverse=True):
+        image = rasterise_svg(candidate, size) if candidate.suffix.lower() == ".svg" else decode(candidate.read_bytes())
+        if image is None:
+            continue
+        if best is None or image.width > best.width:
+            best = image
+        if best.width >= 96:
+            break
+    return best
+
+
+def executables_in(command):
+    """The binaries a .desktop Exec line ends up running.
+
+    Applications installed outside the package manager -- AppImages, self-contained builds --
+    are usually launched through a wrapper script, and their icon lives in their own install
+    tree rather than in any icon theme. So the wrapper is read for the absolute paths it
+    mentions, and those are searched too."""
+    if not command:
+        return []
+
+    first = Path(command.split()[0])
+    found = [first] if first.is_file() else []
+
+    if first.is_file() and first.stat().st_size < 256 * 1024:
+        try:
+            text = first.read_text(errors="replace")
+        except OSError:
+            return found
+        if text.startswith("#!"):
+            for token in re.findall(r"/[\w.@+/-]+", text.replace("$HOME", str(Path.home()))):
+                path = Path(token)
+                if path.is_file() and path not in found:
+                    found.append(path)
+    return found
+
+
+def icon_near_executable(command, name):
+    """Looks for an icon inside an application's own install tree."""
+    if not name:
+        return None
+
+    for executable in executables_in(command):
+        # bin/foo -> the prefix that holds share/, resources/, lib/ alongside it
+        prefix = executable.parent.parent if executable.parent.name == "bin" else executable.parent
+        for subdirectory in ("resources/images", "resources", "share/icons", "share/pixmaps", "share"):
+            root = prefix / subdirectory
+            if not root.is_dir():
+                continue
+            for suffix in (".svg", ".png"):
+                for candidate in sorted(root.rglob(f"{name}{suffix}"))[:4]:
+                    image = rasterise_svg(candidate, 256) if suffix == ".svg" else decode(candidate.read_bytes())
+                    if image is not None:
+                        return image, candidate
+    return None
+
+
+def desktop_entry(path):
+    """Reads a .desktop file into a dict, from its [Desktop Entry] group only."""
+    entry, in_group = {}, False
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError:
+        return entry
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_group = line == "[Desktop Entry]"
+        elif in_group and "=" in line and not line.startswith("#"):
+            field, _, value = line.partition("=")
+            entry.setdefault(field.strip(), value.strip())
+    return entry
+
+
+_command_index = None
+
+
+def command_index():
+    """Maps an executable's basename to a .desktop file that launches it, so a Run Command key
+    can borrow the icon of the application it runs."""
+    global _command_index
+    if _command_index is not None:
+        return _command_index
+
+    _command_index = {}
+    for directory in APPLICATION_DIRS:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.desktop")):
+            executable = desktop_entry(path).get("Exec", "").split()
+            if executable:
+                _command_index.setdefault(Path(executable[0]).name, path)
+    return _command_index
+
+
+def wrap_to_width(draw, text, font, width):
+    """Greedy wrap that also breaks a single word too long to fit, which a plain word wrap
+    leaves hanging off both edges of the key."""
+    lines, line = [], ""
+    for word in text.split():
+        while draw.textlength(word, font=font) > width and len(word) > 1:
+            cut = len(word)
+            while cut > 1 and draw.textlength(word[:cut], font=font) > width:
+                cut -= 1
+            if line:
+                lines.append(line)
+                line = ""
+            lines.append(word[:cut])
+            word = word[cut:]
+        candidate = f"{line} {word}".strip()
+        if line and draw.textlength(candidate, font=font) > width:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+    if line:
+        lines.append(line)
+    return lines
+
+
+def load_font(size):
+    for name in ("LiberationSans-Bold.ttf", "DejaVuSans-Bold.ttf", "NotoSans-Bold.ttf"):
+        for candidate in Path("/usr/share/fonts").rglob(name):
+            try:
+                return ImageFont.truetype(str(candidate), size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def label_tile(text, size, background):
+    """The proposal of last resort: the key's own words, set cleanly, instead of a plugin logo
+    repeated across a page of keys that do different things.
+
+    An empty label is not a failure -- it means OpenDeck already has text for this key and will
+    draw it itself, so the tile is just a clean background to draw it on."""
+    image = Image.new("RGB", size, background)
+    if not text:
+        return image
+
+    draw = ImageDraw.Draw(image)
+    margin = 8
+    usable = size[0] - margin * 2
+
+    # Shrink until it fits the key in both directions, rather than clipping.
+    for font_size in range(26, 8, -2):
+        font = load_font(font_size)
+        lines = wrap_to_width(draw, text, font, usable)
+        spacing = int(font_size * 1.25)
+        if len(lines) * spacing <= size[1] - margin:
+            break
+
+    top = (size[1] - spacing * len(lines)) // 2
+    for index, line in enumerate(lines):
+        width = draw.textlength(line, font=font)
+        draw.text(((size[0] - width) / 2, top + index * spacing), line, font=font, fill="#FFFFFF")
+    return image
+
+
+def resolve_icon(key, background):
+    """Finds the image that belongs on a key. Returns (image, description, is_proposal)."""
+    action = key.get("action") or {}
+    uuid = action.get("uuid", "")
+    settings = key.get("settings") or {}
+
+    if uuid == OPEN_URL_ACTION:
+        url = first_setting(settings, "down", "up", "clockwise", "anticlockwise")
+        if url:
+            try:
+                return favicon(url), url, False
+            except (LookupError, OSError) as error:
+                print(f"    no icon for {url}: {error}")
+
+    elif uuid == LAUNCH_APP_ACTION:
+        path = settings.get("app")
+        if path:
+            entry = desktop_entry(path)
+            image = icon_by_name(entry.get("Icon"))
+            if image is not None:
+                return image, f"{entry.get('Name', Path(path).stem)} ({entry.get('Icon')})", False
+
+            print(f"    no icon named {entry.get('Icon')!r} in any theme; looking in the app's own files")
+            found = icon_near_executable(entry.get("Exec"), entry.get("Icon"))
+            if found is not None:
+                image, source = found
+                return image, f"{entry.get('Name', Path(path).stem)} ({source})", False
+
+    elif uuid == RUN_COMMAND_ACTION:
+        command = first_setting(settings, "down", "up", "rotate")
+        if command:
+            executable = Path(command.split()[0]).name
+            path = command_index().get(executable)
+            if path:
+                image = icon_by_name(desktop_entry(path).get("Icon"))
+                if image is not None:
+                    return image, f"{executable} (via {path.name})", False
+
+    # Nothing authoritative to show. Offer the key's own words on a clean background -- but if
+    # OpenDeck already has text for this key it draws that itself, so the tile stays empty
+    # rather than printing the same words twice. That also makes a second --auto run a no-op
+    # instead of a game of telephone with its own output.
+    existing = (key.get("states") or [{}])[0].get("text", "").strip()
+    label = "" if existing else proposed_label(key)
+    return label_tile(label, KEY_SIZE, background), f"label {label!r}" if label else f"clean background under {existing!r}", True
+
+
+def first_setting(settings, *fields):
+    for field in fields:
+        value = (settings.get(field) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def proposed_label(key):
+    """What to write on a key we could not find a real icon for."""
+    action = key.get("action") or {}
+    settings = key.get("settings") or {}
+
+    if action.get("uuid") == SWITCH_PROFILE_ACTION and settings.get("profile"):
+        return settings["profile"]
+    if action.get("uuid") == RUN_COMMAND_ACTION:
+        tokens = (first_setting(settings, "down", "up", "rotate") or "").split()
+        if tokens:
+            # `opendeck-focus mode launcher` is a launcher key, not an opendeck-focus key: the
+            # subcommand says what it does, the binary only says who does it.
+            return tokens[-1] if len(tokens) > 1 else Path(tokens[0]).name
+    return action.get("name", "?")
+
 
 
 def apply_image(key, image, background, state=None):
@@ -214,38 +527,43 @@ def profile_paths(profiles_root, device, name):
 
 
 def run_auto(profiles_root, device, arguments):
-    """Gives every Open URL key the icon of the site it opens.
+    """Gives every key the image that belongs on it.
 
-    This replaces the image on every such key, including one you picked by hand: OpenDeck
-    rasterises every key to `0.png` on restart, so an icon chosen in the editor and the
-    plugin's default globe are indistinguishable by then. The profile is backed up first."""
-    total = 0
+    This replaces the image on every key it can resolve, including one you picked by hand:
+    OpenDeck rasterises every key to `0.png` on restart, so by then a hand-picked icon and a
+    plugin's default are indistinguishable. Profiles are backed up first."""
+    applied = proposed = 0
+
     for path in profile_paths(profiles_root, device, arguments.profile):
         profile = json.loads(path.read_text())
         changed = False
 
-        for position, key in enumerate(profile.get("keys") or []):
-            if not key or (key.get("action") or {}).get("uuid") != OPEN_URL_ACTION:
+        slots = [("key", index, slot) for index, slot in enumerate(profile.get("keys") or [])]
+        slots += [("dial", index, slot) for index, slot in enumerate(profile.get("sliders") or [])]
+
+        for kind, position, slot in slots:
+            if not slot or not slot.get("states"):
                 continue
-            url = key_url(key)
-            if not url:
-                print(f"  {path.stem} key {position}: no URL set, skipped")
+            print(f"  {path.stem} {kind} {position}: {(slot.get('action') or {}).get('name', '?')}")
+
+            image, description, is_proposal = resolve_icon(slot, arguments.background)
+            if is_proposal and arguments.no_labels:
+                print("    no icon found, leaving it alone")
                 continue
-            print(f"  {path.stem} key {position}: {url}")
-            try:
-                image = favicon(url)
-            except (LookupError, OSError) as error:
-                print(f"    no icon: {error}")
-                continue
-            apply_image(key, image, arguments.background, arguments.state)
+
+            apply_image(slot, image, arguments.background, arguments.state)
+            if is_proposal:
+                proposed += 1
+            else:
+                applied += 1
             changed = True
-            total += 1
+            print(f"    {'proposed' if is_proposal else 'applied'}: {description}")
 
         if changed:
             save(path, profile)
-            print(f"  wrote {path.name}")
+            print(f"  wrote {path.name}\n")
 
-    print(f"\n{total} key(s) given their site's icon.")
+    print(f"{applied} icon(s) applied, {proposed} label(s) proposed.")
 
 
 def main():
@@ -254,7 +572,8 @@ def main():
     parser.add_argument("--profile", help="profile name (default: all of them, with --auto)")
     parser.add_argument("--key", type=int, help="grid position of a single key to set")
     parser.add_argument("--state", type=int, default=None, help="state to set (default: all)")
-    parser.add_argument("--auto", action="store_true", help="give every Open URL key the icon of the site it opens")
+    parser.add_argument("--auto", action="store_true", help="give every key the image that belongs on it")
+    parser.add_argument("--no-labels", action="store_true", help="with --auto, leave a key alone rather than proposing a text tile")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--image", help="path to an image file")
     source.add_argument("--favicon", help="URL or domain whose icon to use")
