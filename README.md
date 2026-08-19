@@ -103,7 +103,23 @@ the left of the editor panel to pick a file (dragging an image onto it works too
 right-click resets it to the plugin's default). The control is an unlabelled canvas, which is
 easy to walk past.
 
-For a page of keys at once, or for scripting a profile from a list of sites:
+To give every **Open URL** key the icon of the site it opens, without naming any of them:
+
+```bash
+./set-key-image.py --auto
+```
+
+It reads the URL off each key and asks that page for its icon: the `<link rel=icon>` tags, the
+apple-touch-icon and the web app manifest are all consulted, largest first, because that is
+where the sharp 180px and 512px versions live -- `/favicon.ico` and Google's favicon cache are
+only the fallbacks, for sites that declare nothing or block the request. Onshape, for instance,
+serves a 144px PNG that `/favicon.ico` alone would have missed.
+
+`--auto` replaces the image on every Open URL key, including one you picked by hand: OpenDeck
+rasterises every key to `0.png` on restart, so by then a hand-picked icon and the plugin's
+default globe are indistinguishable. The profile is backed up first.
+
+Single keys, by URL or from a file:
 
 ```bash
 ./set-key-image.py --profile Default --key 6 --favicon https://cad.onshape.com
