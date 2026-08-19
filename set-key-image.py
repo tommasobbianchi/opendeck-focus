@@ -27,6 +27,7 @@ import argparse
 import base64
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -417,12 +418,15 @@ def label_tile(text, size, background):
     margin = 8
     usable = size[0] - margin * 2
 
-    # Shrink until it fits the key in both directions, rather than clipping.
+    # Shrink until it fits the key in both directions, rather than clipping. A word broken
+    # across two lines reads as a rendering fault rather than a label, so a size that would
+    # need one is rejected while there is still room to go smaller.
     for font_size in range(26, 8, -2):
         font = load_font(font_size)
-        lines = wrap_to_width(draw, text, font, usable)
         spacing = int(font_size * 1.25)
-        if len(lines) * spacing <= size[1] - margin:
+        lines = wrap_to_width(draw, text, font, usable)
+        words_fit = all(draw.textlength(word, font=font) <= usable for word in text.split())
+        if words_fit and len(lines) * spacing <= size[1] - margin:
             break
 
     top = (size[1] - spacing * len(lines)) // 2
@@ -479,6 +483,30 @@ def resolve_icon(key, background):
     return label_tile(label, KEY_SIZE, background), f"label {label!r}" if label else f"clean background under {existing!r}", True
 
 
+def page_name(url):
+    """A name for a page that has no icon -- its <title>, or failing that its host.
+
+    Self-hosted services on a LAN address are the usual case here: no favicon, nothing indexed
+    anywhere, but a perfectly good title sitting in the markup."""
+    try:
+        body, _ = fetch(url if "//" in url else f"https://{url}", limit=64 * 1024)
+        match = re.search(r"<title[^>]*>(.*?)</title>", body.decode("utf-8", "replace"), re.I | re.S)
+        if match:
+            title = " ".join(match.group(1).split())
+            # Titles are often "Name - section - site"; the first part is the name.
+            for separator in ("—", "–", " - ", " | ", ": "):
+                if separator in title:
+                    title = title.split(separator)[0].strip()
+                    break
+            if title:
+                return title[:24]
+    except Exception:  # noqa: BLE001 -- an unreachable host just means fall back to the URL
+        pass
+
+    host = urllib.parse.urlparse(url if "//" in url else f"https://{url}").netloc
+    return (host or url).removeprefix("www.").split(":")[0]
+
+
 def first_setting(settings, *fields):
     for field in fields:
         value = (settings.get(field) or "").strip()
@@ -494,6 +522,11 @@ def proposed_label(key):
 
     if action.get("uuid") == SWITCH_PROFILE_ACTION and settings.get("profile"):
         return settings["profile"]
+    if action.get("uuid") == OPEN_URL_ACTION:
+        url = first_setting(settings, "down", "up", "clockwise", "anticlockwise")
+        if url:
+            return page_name(url)
+
     if action.get("uuid") == RUN_COMMAND_ACTION:
         tokens = (first_setting(settings, "down", "up", "rotate") or "").split()
         if tokens:
@@ -625,22 +658,49 @@ def scan(profiles_root, device):
                     yield path.stem, controller, position, slot
 
 
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "opendeck-icons.json"
+
+
+def load_known():
+    try:
+        return json.loads(CACHE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def save_known(known):
+    try:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE.write_text(json.dumps(known))
+    except OSError as error:
+        print(f"    could not write {CACHE}: {error}")
+
+
 def run_watch(profiles_root, device, arguments):
     """Gives a key its icon as soon as it gets a purpose, without stopping OpenDeck.
 
-    The first pass only remembers what is already there: at startup every key looks new, and
+    What has already been seen is remembered on disk. Without that, every restart of this
+    service -- a logout, a crash, an edit to it -- would silently adopt whatever you had added
+    since as 'already known' and those keys would never get an icon. That is exactly how two
+    keys ended up bare.
+
+    Only the very first run ever is silent, because at that point every key looks new and
     claiming them all would wipe images set by hand. Run --auto once for the initial fill."""
-    known = {}
-    first_pass = True
-    print(f"Watching {profiles_root / device} for new keys. Ctrl-C to stop.")
+    known = load_known()
+    first_pass = known is None
+    known = known or {}
+    print(f"Watching {profiles_root / device}"
+          + (" (first run: adopting what is already there)" if first_pass else f" ({len(known)} key(s) known)"))
 
     while True:
+        dirty = False
         for profile, controller, position, slot in scan(profiles_root, device):
-            key = (profile, controller, position)
+            key = f"{profile}.{controller}.{position}"
             current = signature(slot)
             if known.get(key) == current:
                 continue
             known[key] = current
+            dirty = True
 
             if first_pass:
                 continue
@@ -660,6 +720,8 @@ def run_watch(profiles_root, device, arguments):
                 print(f"    could not reach OpenDeck to apply {description}")
                 del known[key]  # try again next time round
 
+        if dirty:
+            save_known(known)
         first_pass = False
         time.sleep(arguments.interval)
 
