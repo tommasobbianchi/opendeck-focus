@@ -51,12 +51,15 @@ export default class OpenDeckFocusExtension {
         const window = global.display.focus_window;
 
         if (!window) {
-            return JSON.stringify({ wm_class: '', title: '' });
+            return JSON.stringify({ wm_class: '', title: '', pid: 0 });
         }
 
         return JSON.stringify({
             wm_class: window.get_wm_class() || '',
             title: window.get_title() || '',
+            // Consumers resolve /proc/<pid>/exe from this; 0 when the window has no local
+            // process, which is normal for some XWayland surfaces.
+            pid: window.get_pid() || 0,
         });
     }
 

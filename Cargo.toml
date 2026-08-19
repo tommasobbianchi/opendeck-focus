@@ -1,14 +1,13 @@
 [package]
 name = "opendeck-focus"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 futures-lite = "2.6.0"
 log = "0.4.27"
-openaction = "1.1.5"
-serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 simplelog = "0.12.2"
-tokio = { version = "1.44.2", features = ["full"] }
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+x11rb = "0.13.1"
 zbus = { version = "5.5.0", default-features = false, features = ["tokio"] }

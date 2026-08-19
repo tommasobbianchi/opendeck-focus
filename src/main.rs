@@ -1,81 +1,82 @@
-//! Switches OpenDeck profiles to follow the focused window on GNOME Wayland.
+//! Makes an OpenDeck deck contextual on GNOME Wayland, and gives it a launcher page.
 //!
-//! OpenDeck can already switch profiles per application, but its window watcher only covers
-//! X11 and KDE. Under GNOME Wayland nothing can see the focused window from outside the
-//! compositor -- org.gnome.Shell.Introspect answers AccessDenied to unlisted callers -- so the
-//! companion shell extension publishes it on the session bus and this plugin relays it.
+//! OpenDeck already switches profiles per application and already has a launcher plugin; the
+//! only thing missing on GNOME is that nothing outside the compositor can see which window has
+//! focus (`org.gnome.Shell.Introspect` answers AccessDenied, and XWayland's
+//! `_NET_ACTIVE_WINDOW` is meaningless for native Wayland clients). So this daemon does two
+//! small things and delegates the rest:
+//!
+//!   * a companion shell extension reports focus changes on the session bus, and we mirror them
+//!     onto an X11 shim window that OpenDeck's own watcher already looks at (see `shim`);
+//!   * a mode socket lets a deck key pin a synthetic application, which OpenDeck maps to the
+//!     launcher profile exactly like any real one.
+//!
+//! No OpenDeck patch, no profile-switch events, no rules file: the application-to-profile
+//! mapping lives in OpenDeck's own UI, where a user would look for it.
 
 use futures_lite::StreamExt;
-use openaction::*;
-use serde::Serialize;
-use std::sync::{Arc, LazyLock};
-use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 
-mod rules;
-use rules::Config;
+mod shim;
+use shim::Shim;
 
-/// Non-spec, OpenDeck-specific: its inbound handler takes a bare device/profile pair.
-#[derive(Serialize)]
-struct SwitchProfileEvent {
-    event: &'static str,
-    device: String,
-    profile: String,
+/// Synthetic WM_CLASS published while the launcher is pinned. It shows up in OpenDeck's
+/// application list like any other app, and is mapped to the launcher profile there.
+const LAUNCHER_CLASS: &str = "OpenDeckLauncher";
+
+const DBUS_INTERFACE: &str = "org.gnome.Shell.Extensions.OpenDeckFocus";
+const DBUS_PATH: &str = "/org/gnome/Shell/Extensions/OpenDeckFocus";
+
+#[derive(Clone, Debug, PartialEq)]
+struct Window {
+    wm_class: String,
+    title: String,
+    pid: u32,
 }
 
-/// The profile we last asked for, so an unchanged focus does not cause a repaint.
-/// Every switch clears and redraws the deck, so this is not a micro-optimisation:
-/// without it, focus churn makes the keys flicker.
-static CURRENT: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
-
-struct GlobalEventHandler {}
-impl openaction::GlobalEventHandler for GlobalEventHandler {
-    async fn plugin_ready(&self, _outbound: &mut OutboundEventManager) -> EventHandlerResult {
-        let config = match Config::load() {
-            Ok(config) => config,
-            Err(error) => {
-                // Not fatal: a missing rules file should leave OpenDeck usable, not wedge it.
-                log::error!("{error}");
-                log::error!(
-                    "Not watching focus. Write {} to enable it.",
-                    Config::path().display()
-                );
-                return Ok(());
-            }
-        };
-
-        log::info!(
-            "Watching focus for device {} with {} rule(s), default profile {:?}",
-            config.device,
-            config.rules.len(),
-            config.default_profile
-        );
-
-        tokio::spawn(watch_focus(Arc::new(config)));
-
-        Ok(())
-    }
+enum Event {
+    Focus(Window),
+    Mode(Mode),
 }
 
-struct ActionEventHandler {}
-impl openaction::ActionEventHandler for ActionEventHandler {}
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    Contextual,
+    Launcher,
+}
 
-async fn watch_focus(config: Arc<Config>) {
+fn socket_path() -> std::path::PathBuf {
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    std::path::Path::new(&runtime).join("opendeck-focus.sock")
+}
+
+fn parse_window(json: &str) -> Option<Window> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    Some(Window {
+        wm_class: value.get("wm_class")?.as_str()?.to_owned(),
+        title: value.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+        pid: value.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+    })
+}
+
+/// Relays `FocusedWindowChanged` from the shell extension. Reconnects forever: the extension
+/// goes away with every shell restart, and this daemon outliving it is the whole point.
+async fn watch_focus(tx: mpsc::Sender<Event>) {
     loop {
-        if let Err(error) = watch_focus_once(&config).await {
-            // The shell restarts on logout, and takes the extension's bus name with it.
-            log::error!("Focus watch stopped: {error}. Retrying in 5s.");
+        if let Err(error) = watch_focus_once(&tx).await {
+            log::warn!("Focus watch stopped: {error}. Retrying in 5s.");
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
 
-async fn watch_focus_once(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn watch_focus_once(tx: &mpsc::Sender<Event>) -> Result<(), Box<dyn std::error::Error>> {
     let connection = zbus::Connection::session().await?;
 
     let mut stream = zbus::MessageStream::for_match_rule(
         zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
-            .interface("org.gnome.Shell.Extensions.OpenDeckFocus")?
+            .interface(DBUS_INTERFACE)?
             .member("FocusedWindowChanged")?
             .build(),
         &connection,
@@ -83,67 +84,143 @@ async fn watch_focus_once(config: &Config) -> Result<(), Box<dyn std::error::Err
     )
     .await?;
 
-    // Ask once up front so the deck matches the window that already has focus, rather than
+    // Ask once up front, so the deck matches the window that already has focus instead of
     // waiting for the user to alt-tab before anything happens.
-    if let Ok(reply) = connection
-        .call_method(
-            Some("org.gnome.Shell"),
-            "/org/gnome/Shell/Extensions/OpenDeckFocus",
-            Some("org.gnome.Shell.Extensions.OpenDeckFocus"),
-            "GetFocusedWindow",
-            &(),
-        )
+    match connection
+        .call_method(Some("org.gnome.Shell"), DBUS_PATH, Some(DBUS_INTERFACE), "GetFocusedWindow", &())
         .await
-        && let Ok(window) = reply.body().deserialize::<String>()
     {
-        apply(config, &window).await;
+        Ok(reply) => {
+            log::info!("Shell extension is loaded");
+            if let Ok(json) = reply.body().deserialize::<String>()
+                && let Some(window) = parse_window(&json)
+            {
+                let _ = tx.send(Event::Focus(window)).await;
+            }
+        }
+        // Not fatal, and the common case on first install: the shell only scans for new
+        // extensions at session start, so it appears at the next login and the signal
+        // subscription below starts producing then.
+        Err(error) => log::warn!("Shell extension not answering ({error}); waiting for it"),
     }
 
-    log::info!("Subscribed to FocusedWindowChanged");
-
     while let Some(message) = stream.next().await {
-        let message = message?;
-        if let Ok(window) = message.body().deserialize::<String>() {
-            apply(config, &window).await;
+        if let Ok(json) = message?.body().deserialize::<String>()
+            && let Some(window) = parse_window(&json)
+        {
+            let _ = tx.send(Event::Focus(window)).await;
         }
     }
 
     Err("signal stream ended".into())
 }
 
-async fn apply(config: &Config, window_json: &str) {
-    let wm_class = serde_json::from_str::<serde_json::Value>(window_json)
-        .ok()
-        .and_then(|v| v.get("wm_class")?.as_str().map(str::to_owned))
-        .unwrap_or_default();
+/// Listens for `launcher` / `contextual` / `toggle` on a datagram socket, which is what the
+/// deck's two screenless buttons send through OpenDeck's Run Command action.
+async fn watch_mode(tx: mpsc::Sender<Event>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = socket_path();
+    let _ = std::fs::remove_file(&path);
+    let socket = tokio::net::UnixDatagram::bind(&path)?;
+    log::info!("Mode socket at {}", path.display());
 
-    let profile = config.profile_for(&wm_class).to_owned();
+    let mut buffer = [0u8; 64];
+    loop {
+        let length = socket.recv(&mut buffer).await?;
+        let mode = match String::from_utf8_lossy(&buffer[..length]).trim() {
+            "launcher" => Mode::Launcher,
+            "contextual" => Mode::Contextual,
+            other => {
+                log::warn!("Unknown mode {other:?}");
+                continue;
+            }
+        };
+        let _ = tx.send(Event::Mode(mode)).await;
+    }
+}
 
-    {
-        let current = CURRENT.read().await;
-        if current.as_deref() == Some(profile.as_str()) {
-            return;
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let shim = Shim::new()?;
+    let (tx, mut rx) = mpsc::channel(16);
+
+    tokio::spawn(watch_focus(tx.clone()));
+    tokio::spawn(async move {
+        if let Err(error) = watch_mode(tx).await {
+            log::error!("Mode socket failed: {error}");
+        }
+    });
+
+    let mut mode = Mode::Contextual;
+    let mut focused: Option<Window> = None;
+    // The window that had focus when the launcher was pinned. Pressing a deck key does not move
+    // focus, so the launcher stays up while you read it -- but launching something does, and at
+    // that point you want the new app's keys, not the launcher you just used.
+    let mut launcher_anchor: Option<String> = None;
+    let mut published = String::new();
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::Focus(window) => {
+                if mode == Mode::Launcher && launcher_anchor.as_deref() != Some(window.wm_class.as_str()) {
+                    log::info!("Focus moved to {:?}; leaving launcher", window.wm_class);
+                    mode = Mode::Contextual;
+                    launcher_anchor = None;
+                }
+                focused = Some(window);
+            }
+            Event::Mode(requested) => {
+                mode = requested;
+                launcher_anchor = match requested {
+                    Mode::Launcher => focused.as_ref().map(|w| w.wm_class.clone()),
+                    Mode::Contextual => None,
+                };
+                log::info!("Mode {mode:?}");
+            }
+        }
+
+        let (class, title, pid) = match (mode, &focused) {
+            (Mode::Launcher, _) => (LAUNCHER_CLASS, "OpenDeck launcher", std::process::id()),
+            (Mode::Contextual, Some(window)) => (window.wm_class.as_str(), window.title.as_str(), window.pid),
+            // Focus unknown -- the shell extension has not loaded yet. Publishing an empty
+            // class is not a no-op: OpenDeck reads it as "no mapping", falls back to its
+            // opendeck_default profile, and so leaving the launcher still takes you somewhere
+            // instead of stranding you on it.
+            (Mode::Contextual, None) => ("", "", 0),
+        };
+
+        // The watcher polls four times a second and only reacts to a changed name, so
+        // republishing an unchanged class would be pure noise in the log.
+        if class == published {
+            continue;
+        }
+        published = class.to_owned();
+
+        log::info!("Publishing {class:?}");
+        if let Err(error) = shim.publish(class, title, pid) {
+            log::error!("Failed to publish to X11: {error}");
         }
     }
 
-    log::info!("Focus {wm_class:?} -> profile {profile:?}");
+    Err("event channel closed".into())
+}
 
-    let event = SwitchProfileEvent {
-        event: "switchProfile",
-        device: config.device.clone(),
-        profile: profile.clone(),
-    };
-
-    if let Some(outbound) = OUTBOUND_EVENT_MANAGER.lock().await.as_mut() {
-        match outbound.send_event(event).await {
-            Ok(()) => *CURRENT.write().await = Some(profile),
-            Err(error) => log::error!("Failed to switch profile: {error}"),
-        }
-    }
+/// `opendeck-focus mode launcher|contextual` -- what the deck's screenless buttons run.
+fn send_mode(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    socket.send_to(mode.as_bytes(), socket_path())?;
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments: Vec<String> = std::env::args().collect();
+    if arguments.len() == 3 && arguments[1] == "mode" {
+        return send_mode(&arguments[2]);
+    }
+    if arguments.len() > 1 {
+        eprintln!("usage: opendeck-focus [mode launcher|contextual]");
+        std::process::exit(2);
+    }
+
     simplelog::TermLogger::init(
         simplelog::LevelFilter::Info,
         simplelog::Config::default(),
@@ -152,7 +229,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .unwrap();
 
-    init_plugin(GlobalEventHandler {}, ActionEventHandler {}).await?;
-
-    Ok(())
+    run().await
 }

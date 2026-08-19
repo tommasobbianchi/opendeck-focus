@@ -1,0 +1,14 @@
+[Unit]
+Description=Publish the GNOME focused window where OpenDeck can see it
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/opendeck-focus
+# The X connection is only there once XWayland is up, which can lag the session target.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
