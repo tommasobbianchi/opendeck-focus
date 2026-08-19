@@ -1,0 +1,7 @@
+{
+  "uuid": "opendeck-focus@nativedev",
+  "name": "OpenDeck Focus",
+  "description": "Exposes the focused window's WM class and title on the session bus, so OpenDeck can switch profiles per application under Wayland. GNOME restricts org.gnome.Shell.Introspect to allowlisted callers, which is why this shim exists.",
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "version": 1
+}

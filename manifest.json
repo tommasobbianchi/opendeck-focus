@@ -1,0 +1,12 @@
+{
+  "Name": "OpenDeck Focus (GNOME Wayland)",
+  "Description": "Switches profiles to follow the focused window on GNOME Wayland, where OpenDeck's built-in application watcher cannot see windows.",
+  "Author": "Tommaso Bianchi",
+  "Version": "0.1.0",
+  "PluginUUID": "dev.native.plugins.opendeck-focus",
+  "CodePathLin": "opendeck-focus-linux",
+  "Icon": "assets/icon",
+  "Category": "Utilities",
+  "OS": [{ "Platform": "linux" }],
+  "Actions": []
+}
