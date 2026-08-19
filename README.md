@@ -96,6 +96,24 @@ The mode keys have to be present in *every* profile, otherwise you could switch 
 way back. `setup-n1.py` stamps them into every profile that exists when it runs; re-run it after
 creating profiles in the UI.
 
+## Key images
+
+OpenDeck sets these from its editor: select a key, then **click the large image preview** on
+the left of the editor panel to pick a file (dragging an image onto it works too, and
+right-click resets it to the plugin's default). The control is an unlabelled canvas, which is
+easy to walk past.
+
+For a page of keys at once, or for scripting a profile from a list of sites:
+
+```bash
+./set-key-image.py --profile Default --key 6 --favicon https://cad.onshape.com
+./set-key-image.py --profile Launcher --key 4 --image ~/Pictures/icon.png
+```
+
+It writes a data URI into the profile; OpenDeck rasterises it into its own image cache on the
+next start, so the result is identical to having picked the file in the editor. Same rule as
+`setup-n1.py`: OpenDeck must be stopped, and the profile is backed up next to itself.
+
 ## Checking it
 
 ```bash
