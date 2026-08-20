@@ -17,6 +17,7 @@
 use futures_lite::StreamExt;
 use tokio::sync::mpsc;
 
+mod identity;
 mod shim;
 use shim::Shim;
 
@@ -37,6 +38,7 @@ struct Window {
 enum Event {
     Focus(Window),
     Mode(Mode),
+    Poll,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -143,6 +145,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = mpsc::channel(16);
 
     tokio::spawn(watch_focus(tx.clone()));
+
+    let poll_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
+        loop {
+            interval.tick().await;
+            if poll_tx.send(Event::Poll).await.is_err() {
+                break;
+            }
+        }
+    });
+
     tokio::spawn(async move {
         if let Err(error) = watch_mode(tx).await {
             log::error!("Mode socket failed: {error}");
@@ -175,16 +189,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 log::info!("Mode {mode:?}");
             }
+            // The foreground program can change without any focus event (you type `claude` in
+            // an already-focused window), so recompute the identity on a timer.
+            Event::Poll => {}
         }
 
         let (class, title, pid) = match (mode, &focused) {
-            (Mode::Launcher, _) => (LAUNCHER_CLASS, "OpenDeck launcher", std::process::id()),
-            (Mode::Contextual, Some(window)) => (window.wm_class.as_str(), window.title.as_str(), window.pid),
+            (Mode::Launcher, _) => (LAUNCHER_CLASS.to_owned(), "OpenDeck launcher".to_owned(), std::process::id()),
+            (Mode::Contextual, Some(window)) => (identity::resolve(&window.wm_class, window.pid), window.title.clone(), window.pid),
             // Focus unknown -- the shell extension has not loaded yet. Publishing an empty
             // class is not a no-op: OpenDeck reads it as "no mapping", falls back to its
             // opendeck_default profile, and so leaving the launcher still takes you somewhere
             // instead of stranding you on it.
-            (Mode::Contextual, None) => ("", "", 0),
+            (Mode::Contextual, None) => (String::new(), String::new(), 0),
         };
 
         // The watcher polls four times a second and only reacts to a changed name, so
@@ -192,10 +209,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if class == published {
             continue;
         }
-        published = class.to_owned();
+        published = class.clone();
 
         log::info!("Publishing {class:?}");
-        if let Err(error) = shim.publish(class, title, pid) {
+        if let Err(error) = shim.publish(&class, &title, pid) {
             log::error!("Failed to publish to X11: {error}");
         }
     }
@@ -213,11 +230,26 @@ fn send_mode(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments: Vec<String> = std::env::args().collect();
+    if arguments.get(1).map(|s| s.as_str()) == Some("identity") {
+        if arguments.len() != 4 {
+            eprintln!("usage: opendeck-focus identity <wm_class> <pid>");
+            std::process::exit(2);
+        }
+        let pid: u32 = match arguments[3].parse() {
+            Ok(pid) => pid,
+            Err(_) => {
+                eprintln!("usage: opendeck-focus identity <wm_class> <pid>");
+                std::process::exit(2);
+            }
+        };
+        println!("{}", identity::resolve(&arguments[2], pid));
+        return Ok(());
+    }
     if arguments.len() == 3 && arguments[1] == "mode" {
         return send_mode(&arguments[2]);
     }
     if arguments.len() > 1 {
-        eprintln!("usage: opendeck-focus [mode launcher|contextual]");
+        eprintln!("usage: opendeck-focus [mode launcher|contextual | identity <wm_class> <pid>]");
         std::process::exit(2);
     }
 
