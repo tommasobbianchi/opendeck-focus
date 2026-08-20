@@ -18,6 +18,7 @@ use futures_lite::StreamExt;
 use tokio::sync::mpsc;
 
 mod identity;
+mod seen;
 mod shim;
 use shim::Shim;
 
@@ -212,6 +213,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         published = class.clone();
 
         log::info!("Publishing {class:?}");
+        seen::record(&class);
         if let Err(error) = shim.publish(&class, &title, pid) {
             log::error!("Failed to publish to X11: {error}");
         }
