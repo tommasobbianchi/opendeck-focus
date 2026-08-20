@@ -53,13 +53,30 @@ pub fn is_terminal(wm_class: &str) -> bool {
 }
 
 /// "kitty" + a claude in the foreground -> "kitty:claude"; anything unresolved -> wm_class alone.
-pub fn resolve(wm_class: &str, pid: u32) -> String {
+///
+/// `title` matters only when the foreground program turns out to be an ssh session: the
+/// process running at the far end is not in this machine's process tree, and the title is the
+/// one thing it can say for itself. See [`crate::remote`].
+pub fn resolve(wm_class: &str, pid: u32, title: &str) -> String {
     // pid 0 or 1 is not a real terminal window; walking init would surface an unrelated
     // foreground process anywhere on the system.
     if !is_terminal(wm_class) || pid <= 1 {
         return wm_class.to_owned();
     }
-    composite(wm_class, foreground_program(pid))
+    let program = foreground_program(pid);
+    composite(wm_class, through_ssh(program, title))
+}
+
+/// Replace a remote shell with what the title says is running inside it, when anything does.
+///
+/// Falling back to "ssh" is deliberate: a remote shell nobody has written a rule for is still
+/// honestly an ssh session, and publishing that is better than publishing the terminal alone.
+fn through_ssh(program: Option<String>, title: &str) -> Option<String> {
+    let name = program?;
+    if !crate::remote::is_remote_shell(&name) {
+        return Some(name);
+    }
+    Some(crate::remote::program_from_title(title, &crate::remote::rules()).unwrap_or(name))
 }
 
 /// Parse one line of /proc/<pid>/stat -> (pgrp, tpgid). Must survive a comm containing spaces
@@ -190,6 +207,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_ssh_session_is_named_by_what_the_title_says_runs_inside_it() {
+        // The process tree only ever shows ssh: the real program is on another machine.
+        assert_eq!(
+            through_ssh(Some("ssh".into()), "◐ Project files realignment"),
+            Some("claude".into())
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_remote_session_stays_honestly_ssh() {
+        assert_eq!(through_ssh(Some("ssh".into()), "tommaso@nativedev: ~"), Some("ssh".into()));
+        assert_eq!(through_ssh(Some("ssh".into()), ""), Some("ssh".into()));
+    }
+
+    #[test]
+    fn a_local_program_ignores_the_title_completely() {
+        // A local vim whose title happens to spin is still vim.
+        assert_eq!(through_ssh(Some("vim".into()), "◐ Project files"), Some("vim".into()));
+        assert_eq!(through_ssh(None, "◐ anything"), None);
+    }
+
+    #[test]
     fn parse_stat_plain() {
         let line = "1234 (bash) S 1 1200 1200 34816 1300 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
         assert_eq!(parse_stat(line), Some((1200, 1300)));
@@ -244,13 +283,13 @@ mod tests {
 
     #[test]
     fn resolve_non_terminal_returns_class() {
-        assert_eq!(resolve("google-chrome", 1234), "google-chrome");
+        assert_eq!(resolve("google-chrome", 1234, ""), "google-chrome");
     }
 
     #[test]
     fn resolve_zero_pid_returns_class() {
-        assert_eq!(resolve("kitty", 0), "kitty");
-        assert_eq!(resolve("kitty", 1), "kitty");
+        assert_eq!(resolve("kitty", 0, ""), "kitty");
+        assert_eq!(resolve("kitty", 1, ""), "kitty");
     }
 
     #[test]

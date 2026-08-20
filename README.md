@@ -53,6 +53,32 @@ clients ours stands. When an XWayland client is focused both are correct anyway,
 class strings can differ slightly (GNOME's `wm_class` vs the X property), which can show the
 same app twice in OpenDeck's application list.
 
+## A terminal holding an ssh session
+
+The identity walk reads *this* machine's process tree, so a kitty window running
+`ssh nativedev` resolves to `kitty:ssh` whatever is running at the far end — the interesting
+process is on another computer and simply is not there to find. Mapping a profile to
+`kitty:claude` in that setup produces a mapping that can never fire.
+
+One thing does cross the connection: the title. A remote program sets it with an OSC escape,
+ssh carries the bytes, and the terminal puts it in the window title, which the shell extension
+already hands us next to the class. So when the foreground program is a remote shell, the title
+is consulted — Claude Code writes its session summary there behind a rotating spinner glyph
+(`◐ Project files realignment`), which is enough to publish `kitty:claude` honestly.
+
+An unrecognised remote session stays `kitty:ssh`, which is true rather than convenient.
+
+The rules are data, at `$XDG_CONFIG_HOME/opendeck-focus/remote.json`:
+
+```json
+[{"program": "vim", "contains": [" - VIM"]},
+ {"program": "htop", "starts_with": ["htop"]}]
+```
+
+Prefix and substring only, no regular expressions, and a rule that would match nothing is
+refused rather than quietly matching everything. Later rules win, so a file here overrides the
+built-in claude rule.
+
 ## The two screenless buttons
 
 The N1's two buttons without screens are the mode keys, bound to `Run Command`:

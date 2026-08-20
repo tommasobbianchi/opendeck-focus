@@ -18,6 +18,7 @@ use futures_lite::StreamExt;
 use tokio::sync::mpsc;
 
 mod identity;
+mod remote;
 mod seen;
 mod shim;
 use shim::Shim;
@@ -197,7 +198,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         let (class, title, pid) = match (mode, &focused) {
             (Mode::Launcher, _) => (LAUNCHER_CLASS.to_owned(), "OpenDeck launcher".to_owned(), std::process::id()),
-            (Mode::Contextual, Some(window)) => (identity::resolve(&window.wm_class, window.pid), window.title.clone(), window.pid),
+            (Mode::Contextual, Some(window)) => (
+                identity::resolve(&window.wm_class, window.pid, &window.title),
+                window.title.clone(),
+                window.pid,
+            ),
             // Focus unknown -- the shell extension has not loaded yet. Publishing an empty
             // class is not a no-op: OpenDeck reads it as "no mapping", falls back to its
             // opendeck_default profile, and so leaving the launcher still takes you somewhere
@@ -233,8 +238,8 @@ fn send_mode(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments: Vec<String> = std::env::args().collect();
     if arguments.get(1).map(|s| s.as_str()) == Some("identity") {
-        if arguments.len() != 4 {
-            eprintln!("usage: opendeck-focus identity <wm_class> <pid>");
+        if arguments.len() < 4 || arguments.len() > 5 {
+            eprintln!("usage: opendeck-focus identity <wm_class> <pid> [window title]");
             std::process::exit(2);
         }
         let pid: u32 = match arguments[3].parse() {
@@ -244,7 +249,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(2);
             }
         };
-        println!("{}", identity::resolve(&arguments[2], pid));
+        let title = arguments.get(4).map(String::as_str).unwrap_or("");
+        println!("{}", identity::resolve(&arguments[2], pid, title));
         return Ok(());
     }
     if arguments.len() == 3 && arguments[1] == "mode" {
