@@ -629,9 +629,13 @@ def push_image(device, profile, position, controller, data_uri):
     binary = opendeck_binary()
     if binary is None:
         return False
+    # OpenDeck wants the context as the flat string it uses everywhere else --
+    # device.profile.controller.position.index. Handing it the object those fields came from
+    # is refused with "invalid type: map, expected a string", and because the refusal is only
+    # a warning in OpenDeck's log the watcher looks like it is working while pushing nothing.
     message = json.dumps({
         "event": "setImage",
-        "context": {"device": device, "profile": profile, "controller": controller, "position": position},
+        "context": f"{device}.{profile}.{controller}.{position}.0",
         "payload": {"image": data_uri},
     })
     result = subprocess.run([binary, "--process-message", message], capture_output=True, timeout=30)
