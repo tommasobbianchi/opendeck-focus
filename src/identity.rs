@@ -58,6 +58,13 @@ pub fn is_terminal(wm_class: &str) -> bool {
 /// process running at the far end is not in this machine's process tree, and the title is the
 /// one thing it can say for itself. See [`crate::remote`].
 pub fn resolve(wm_class: &str, pid: u32, title: &str) -> String {
+    // A rule written for this application wins outright: a browser is one WM_CLASS whether you
+    // are in Gmail, Onshape or YouTube, and only the title tells them apart. Nothing in the
+    // process tree can, so there is nothing to weigh this against.
+    let rules = crate::titles::rules();
+    if let Some(program) = crate::titles::program_from_title(title, Some(wm_class), &rules) {
+        return format!("{wm_class}:{program}");
+    }
     // pid 0 or 1 is not a real terminal window; walking init would surface an unrelated
     // foreground process anywhere on the system.
     if !is_terminal(wm_class) || pid <= 1 {
@@ -73,10 +80,10 @@ pub fn resolve(wm_class: &str, pid: u32, title: &str) -> String {
 /// honestly an ssh session, and publishing that is better than publishing the terminal alone.
 fn through_ssh(program: Option<String>, title: &str) -> Option<String> {
     let name = program?;
-    if !crate::remote::is_remote_shell(&name) {
+    if !crate::titles::is_remote_shell(&name) {
         return Some(name);
     }
-    Some(crate::remote::program_from_title(title, &crate::remote::rules()).unwrap_or(name))
+    Some(crate::titles::program_from_title(title, None, &crate::titles::rules()).unwrap_or(name))
 }
 
 /// Parse one line of /proc/<pid>/stat -> (pgrp, tpgid). Must survive a comm containing spaces

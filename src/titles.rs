@@ -1,18 +1,19 @@
-//! What is running on the *other* side of an ssh connection.
+//! What the window title says, when the class does not say enough.
 //!
-//! The identity walk reads the local process tree, so a terminal holding an ssh session
-//! resolves to `kitty:ssh` no matter what is running at the far end. There is no local process
-//! to find: the interesting one is on another machine.
+//! Two applications have the same problem from opposite directions. A terminal holding an ssh
+//! session resolves to `kitty:ssh` whatever runs at the far end, because the interesting
+//! process is on another machine. A browser resolves to `google-chrome` whether you are in
+//! Gmail, Onshape or YouTube, because as far as the window manager is concerned it is one
+//! application.
 //!
-//! One thing does cross the connection -- the title. A remote program sets it with an OSC
-//! escape, ssh carries the bytes, and the terminal puts it in the window title, which the shell
-//! extension already hands us alongside the class. So when the foreground program is a remote
-//! shell, the title is the only evidence there is, and this module reads it.
+//! In both cases the title is the only evidence there is, and the shell extension already hands
+//! it to us alongside the class. So this module reads it: a rule with a `class` fires when that
+//! application has focus, and a rule without one fires only inside a remote shell.
 //!
-//! The rules are data, not code: a JSON file at `$XDG_CONFIG_HOME/opendeck-focus/remote.json`
-//! adds or replaces them, so a new remote program needs an edit, not a release. Matching is
-//! prefix and substring only -- no regular expressions, because a rule someone writes at
-//! midnight should fail visibly rather than match everything.
+//! The rules are data, not code: a JSON file at `$XDG_CONFIG_HOME/opendeck-focus/titles.json`
+//! adds or replaces them, so a new site or a new remote program needs an edit, not a release.
+//! Matching is prefix and substring only -- no regular expressions, because a rule someone
+//! writes at midnight should fail visibly rather than match everything.
 
 use std::path::PathBuf;
 
@@ -21,6 +22,9 @@ pub const REMOTE_SHELLS: &[&str] = &["ssh", "mosh-client", "mosh", "et", "eterna
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rule {
+    /// The WM_CLASS this rule belongs to. `None` means "any remote shell", which is where the
+    /// title trick started and where a rule with no application in mind still belongs.
+    pub class: Option<String>,
     pub program: String,
     pub starts_with: Vec<String>,
     pub contains: Vec<String>,
@@ -30,6 +34,7 @@ pub struct Rule {
 /// rotates while it works. Measured on 2026-08-20: "◐ Project files realignment".
 fn built_in() -> Vec<Rule> {
     vec![Rule {
+        class: None,
         program: "claude".to_owned(),
         starts_with: ["◐", "◑", "◒", "◓", "✻", "✽", "✳", "✢"]
             .iter()
@@ -45,7 +50,7 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".config")
         });
-    base.join("opendeck-focus").join("remote.json")
+    base.join("opendeck-focus").join("titles.json")
 }
 
 /// Rules from disk, appended to the built-in ones. A file that will not parse is reported and
@@ -81,6 +86,7 @@ pub fn parse(text: &str) -> Result<Vec<Rule>, String> {
                 .unwrap_or_default()
         };
         let rule = Rule {
+            class: entry.get("class").and_then(|v| v.as_str()).map(str::to_owned),
             program: program.to_owned(),
             starts_with: list("starts_with"),
             contains: list("contains"),
@@ -93,10 +99,11 @@ pub fn parse(text: &str) -> Result<Vec<Rule>, String> {
     Ok(out)
 }
 
-/// The program a title points at, if any rule recognises it.
+/// The program a title points at, among the rules that apply to `class`.
 ///
-/// Later rules win, so a user file overrides a built-in for the same title.
-pub fn program_from_title(title: &str, rules: &[Rule]) -> Option<String> {
+/// `class` of `None` asks for the remote-shell rules. Later rules win, so a user file overrides
+/// a built-in for the same title.
+pub fn program_from_title(title: &str, class: Option<&str>, rules: &[Rule]) -> Option<String> {
     let trimmed = title.trim();
     if trimmed.is_empty() {
         return None;
@@ -104,6 +111,14 @@ pub fn program_from_title(title: &str, rules: &[Rule]) -> Option<String> {
     let lower = trimmed.to_lowercase();
     let mut found = None;
     for rule in rules {
+        let applies = match (&rule.class, class) {
+            (None, None) => true,
+            (Some(rule_class), Some(window_class)) => rule_class.eq_ignore_ascii_case(window_class),
+            _ => false,
+        };
+        if !applies {
+            continue;
+        }
         let hit = rule.starts_with.iter().any(|p| trimmed.starts_with(p.as_str()))
             || rule.contains.iter().any(|c| lower.contains(&c.to_lowercase()));
         if hit {
@@ -125,33 +140,52 @@ mod tests {
     fn a_spinning_claude_is_recognised_through_ssh() {
         let rules = built_in();
         // Real titles, sampled from the session that found this bug.
-        assert_eq!(program_from_title("◐ Project files realignment", &rules), Some("claude".into()));
-        assert_eq!(program_from_title("◑ Project files realignment", &rules), Some("claude".into()));
+        assert_eq!(program_from_title("◐ Project files realignment", None, &rules), Some("claude".into()));
+        assert_eq!(program_from_title("◑ Project files realignment", None, &rules), Some("claude".into()));
     }
 
     #[test]
     fn an_ordinary_remote_shell_is_left_alone() {
         let rules = built_in();
-        assert_eq!(program_from_title("tommaso@nativedev: ~", &rules), None);
-        assert_eq!(program_from_title("~/projects", &rules), None);
-        assert_eq!(program_from_title("", &rules), None);
-        assert_eq!(program_from_title("   ", &rules), None);
+        assert_eq!(program_from_title("tommaso@nativedev: ~", None, &rules), None);
+        assert_eq!(program_from_title("~/projects", None, &rules), None);
+        assert_eq!(program_from_title("", None, &rules), None);
+        assert_eq!(program_from_title("   ", None, &rules), None);
     }
 
     #[test]
     fn a_glyph_without_its_space_does_not_count() {
         // "◐hello" is somebody's prompt, not Claude Code, which always writes "<glyph> <text>".
-        assert_eq!(program_from_title("◐hello", &built_in()), None);
+        assert_eq!(program_from_title("◐hello", None, &built_in()), None);
+    }
+
+    #[test]
+    fn a_rule_with_a_class_fires_for_that_application_and_no_other() {
+        let rules = parse(r#"[{"class": "google-chrome", "program": "gmail", "contains": [" - Gmail"]}]"#).unwrap();
+        let title = "Inbox (12) - tommaso@gmail.com - Gmail";
+        assert_eq!(program_from_title(title, Some("google-chrome"), &rules), Some("gmail".into()));
+        assert_eq!(program_from_title(title, Some("firefox"), &rules), None, "wrong application");
+        assert_eq!(program_from_title(title, None, &rules), None, "not a remote shell rule");
+    }
+
+    #[test]
+    fn a_class_rule_and_a_remote_rule_do_not_see_each_other() {
+        let mut rules = built_in();  // the claude rule, class: None
+        rules.extend(parse(r#"[{"class": "kitty", "program": "notes", "contains": ["Notes"]}]"#).unwrap());
+        // The claude rule must not fire just because a window class was given...
+        assert_eq!(program_from_title("\u{25d0} Something", Some("kitty"), &rules), None);
+        // ...and it still fires for a remote shell.
+        assert_eq!(program_from_title("\u{25d0} Something", None, &rules), Some("claude".into()));
     }
 
     #[test]
     fn user_rules_extend_and_override_the_built_in_ones() {
         let mut rules = built_in();
         rules.extend(parse(r#"[{"program": "vim", "contains": [" - VIM"]}]"#).unwrap());
-        assert_eq!(program_from_title("main.rs (~/src) - VIM", &rules), Some("vim".into()));
+        assert_eq!(program_from_title("main.rs (~/src) - VIM", None, &rules), Some("vim".into()));
 
         rules.extend(parse(r#"[{"program": "kimi", "starts_with": ["◐ "]}]"#).unwrap());
-        assert_eq!(program_from_title("◐ something", &rules), Some("kimi".into()),
+        assert_eq!(program_from_title("◐ something", None, &rules), Some("kimi".into()),
                    "the later rule wins, so a user file can override a built-in");
     }
 
@@ -166,6 +200,6 @@ mod tests {
     #[test]
     fn matching_is_case_insensitive_for_contains_and_exact_for_prefixes() {
         let rules = parse(r#"[{"program": "claude", "contains": ["Claude Code"]}]"#).unwrap();
-        assert_eq!(program_from_title("running claude code now", &rules), Some("claude".into()));
+        assert_eq!(program_from_title("running claude code now", None, &rules), Some("claude".into()));
     }
 }

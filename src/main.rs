@@ -18,9 +18,9 @@ use futures_lite::StreamExt;
 use tokio::sync::mpsc;
 
 mod identity;
-mod remote;
 mod seen;
 mod shim;
+mod titles;
 use shim::Shim;
 
 /// Synthetic WM_CLASS published while the launcher is pinned. It shows up in OpenDeck's
