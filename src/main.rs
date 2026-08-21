@@ -17,6 +17,7 @@
 use futures_lite::StreamExt;
 use tokio::sync::mpsc;
 
+mod banks;
 mod identity;
 mod seen;
 mod shim;
@@ -40,6 +41,8 @@ struct Window {
 enum Event {
     Focus(Window),
     Mode(Mode),
+    /// The dial: +1 for a turn one way, -1 the other.
+    Page(isize),
     Poll,
 }
 
@@ -130,15 +133,19 @@ async fn watch_mode(tx: mpsc::Sender<Event>) -> Result<(), Box<dyn std::error::E
     let mut buffer = [0u8; 64];
     loop {
         let length = socket.recv(&mut buffer).await?;
-        let mode = match String::from_utf8_lossy(&buffer[..length]).trim() {
-            "launcher" => Mode::Launcher,
-            "contextual" => Mode::Contextual,
+        let message = String::from_utf8_lossy(&buffer[..length]).trim().to_owned();
+        let event = match message.as_str() {
+            "launcher" => Event::Mode(Mode::Launcher),
+            "contextual" => Event::Mode(Mode::Contextual),
+            "page next" | "page" => Event::Page(1),
+            "page previous" | "page prev" => Event::Page(-1),
+            "page first" => Event::Page(0),
             other => {
-                log::warn!("Unknown mode {other:?}");
+                log::warn!("Unknown message {other:?}");
                 continue;
             }
         };
-        let _ = tx.send(Event::Mode(mode)).await;
+        let _ = tx.send(event).await;
     }
 }
 
@@ -172,6 +179,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // that point you want the new app's keys, not the launcher you just used.
     let mut launcher_anchor: Option<String> = None;
     let mut published = String::new();
+    // Which page of keys is showing, and for which application. A page belongs to the app it
+    // was turned to: walking away and coming back starts at the first page, because the second
+    // page of Onshape means nothing while you are in a browser tab.
+    let mut bank: usize = 0;
+    let mut bank_owner = String::new();
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -190,6 +202,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Mode::Contextual => None,
                 };
                 log::info!("Mode {mode:?}");
+            }
+            Event::Page(step) => {
+                let pages = banks::count(&bank_owner);
+                bank = if step == 0 { 0 } else { banks::advance(bank, pages, step) };
+                log::info!("Page {} of {pages} for {bank_owner:?}", bank + 1);
             }
             // The foreground program can change without any focus event (you type `claude` in
             // an already-focused window), so recompute the identity on a timer.
@@ -210,6 +227,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             (Mode::Contextual, None) => (String::new(), String::new(), 0),
         };
 
+        // A different application is a fresh start: its pages are not this one's pages.
+        if class != bank_owner {
+            bank_owner = class.clone();
+            bank = 0;
+        }
+        let class = banks::with_bank(&class, bank);
+
         // The watcher polls four times a second and only reacts to a changed name, so
         // republishing an unchanged class would be pure noise in the log.
         if class == published {
@@ -227,7 +251,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Err("event channel closed".into())
 }
 
-/// `opendeck-focus mode launcher|contextual` -- what the deck's screenless buttons run.
+/// `opendeck-focus mode launcher|contextual`, `opendeck-focus page next|previous|first` --
+/// what the deck's screenless buttons and its dial run.
 fn send_mode(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
     let socket = std::os::unix::net::UnixDatagram::unbound()?;
     socket.send_to(mode.as_bytes(), socket_path())?;
@@ -256,8 +281,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if arguments.len() == 3 && arguments[1] == "mode" {
         return send_mode(&arguments[2]);
     }
+    // `page next` is what the dial runs; `page` alone means the same, because a Run Command
+    // action bound to a rotation is easier to type without an argument.
+    if arguments.len() >= 2 && arguments[1] == "page" {
+        let which = arguments.get(2).map(String::as_str).unwrap_or("next");
+        return send_mode(&format!("page {which}"));
+    }
     if arguments.len() > 1 {
-        eprintln!("usage: opendeck-focus [mode launcher|contextual | identity <wm_class> <pid>]");
+        eprintln!(
+            "usage: opendeck-focus [mode launcher|contextual | page next|previous|first \
+             | identity <wm_class> <pid> [title]]"
+        );
         std::process::exit(2);
     }
 
